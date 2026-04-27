@@ -1,1 +1,198 @@
+-- --> SQL CODE TO LOAD DATA INTO ENTIRE SILVER LAYER, ALL 6 TABLES <-- --
 
+-- Inserting into silver crm_cust_info --
+Truncate Table silver.crm_cust_info;
+insert into silver.crm_cust_info (
+	cst_id,
+    cst_key,
+    cst_firstname,
+    cst_lastname,
+    cst_marital_status,
+    cst_gndr,
+    cst_create_date
+)
+
+with rank_flag as (
+select *,
+row_number() over( partition by cst_id order by cst_create_date desc) as rank_flag
+from bronze.crm_cust_info )
+
+select 
+	cst_id, 
+	cst_key,
+	Trim(cst_firstname)  as cst_firstname,
+	Trim(cst_lastname) as cst_lastname, 
+	case
+		when upper(trim(cst_marital_status)) = "S" Then "Single"
+        when upper(trim(cst_marital_status)) = "M" Then "Married"
+        else "Unknown"
+    end as cst_marital_status,
+	case
+		when upper(trim(cst_gndr)) = "F" Then "Female"
+        when upper(trim(cst_gndr)) = "M" Then "Male"
+        else "Unknown"
+    end as cst_gndr,
+	cst_create_date
+from rank_flag
+where rank_flag = 1;
+
+-- ========================================================================== --
+
+-- --> DATA LOADING INTO SILVER LAYER CRM_PRD_INFO TABLE <-- --
+Truncate Table silver.crm_prd_info;
+Insert into silver.crm_prd_info(
+prd_id,
+cat_id,
+prd_key,
+prd_nm,
+prd_cost,
+prd_line,
+prd_start_dt, 
+prd_end_dt
+)
+SELECT 
+	prd_id,
+	REPLACE(SUBSTRING( prd_key , 1,5),'-','_') as cat_id, -- Extract Category ID     -- Derived column
+	SUBSTRING( prd_key , 7 , length(prd_key)) as prd_key, -- Extract Product Key     -- Derived column
+	prd_nm,
+	prd_cost,
+	CASE 
+		when UPPER(TRIM(prd_line)) = "M" THEN "Mountain"
+        when UPPER(TRIM(prd_line)) = "S" THEN "Other Sales"
+        when UPPER(TRIM(prd_line)) = "T" THEN "Touring"
+        when UPPER(TRIM(prd_line)) = "R" THEN "Road"
+        else "Unknown"
+    END as prd_line,                                       -- Map product line codes to descriptive values
+	Date(prd_start_dt) as prd_start_dt,                    -- Datetime to DATE 
+	Date(date_sub(
+		Lead(prd_start_dt) over(partition by prd_key order by prd_start_dt),
+        interval 1 Day 
+        )) as prd_end_dt                                   -- Calculate end date as one day before the next start date
+FROM bronze.crm_prd_info;
+
+-- ====================================================================== --
+
+-- --> DATA LOADING INTO SILVER LAYER CRM_SALES_DETAILS TABLE <-- --
+Truncate Table silver.crm_sales_details;
+
+Insert into silver.crm_sales_details (
+sls_ord_num, 
+sls_prd_key,
+sls_cust_id,
+sls_order_dt,
+sls_ship_dt,
+sls_due_dt,
+sls_sales,
+sls_quantity,
+sls_price
+)
+ 
+with sales_price as (select 
+	sls_ord_num, 
+	sls_prd_key, 
+	sls_cust_id,
+	Case
+		when sls_order_dt = 0 or length(sls_order_dt) != 8 then null
+		else cast(sls_order_dt as date)                                   -- HANDLING INVALID DATE and DATA TYPECASTING --
+	end as sls_order_dt,
+    Case
+		when sls_ship_dt = 0 or length(sls_ship_dt) != 8 then null
+		else cast(sls_ship_dt as date)                                    -- HANDLING INVALID DATE and DATA TYPECASTING --
+	end as sls_ship_dt,
+     Case
+		when sls_due_dt = 0 or length(sls_due_dt) != 8 then null
+		else cast(sls_due_dt as date)                                     -- HANDLING INVALID DATE and DATA TYPECASTING --
+	end as sls_due_dt,
+	sls_sales as old_sls_sales,
+	sls_quantity,
+	  Case
+		when sls_price is NULL or sls_price <= 0 then sls_sales/NULLIF(sls_quantity,0)
+        else sls_price
+    end as sls_price                                                    -- DERIVE PRICE IF ORIGINAL VALUE IS MISSING --
+from bronze.crm_sales_details),
+
+CTE as (select *,
+Case
+		when old_sls_sales is NULL or old_sls_sales <= 0 or old_sls_sales != sls_quantity * abs(sls_price) then sls_quantity * abs(sls_price)
+        else old_sls_sales
+end as sls_sales                                                       -- RECALCULATE SALES IF ORIGINAL VALUE IS MISSING OR INCORRECT --
+from sales_price)
+
+select
+sls_ord_num,
+sls_prd_key,
+sls_cust_id,
+sls_order_dt,
+sls_ship_dt,
+sls_due_dt, 
+sls_sales,
+sls_quantity,
+sls_price
+from CTE;
+
+-- ========================================================================== --
+
+-- --> DATA LOADING INTO SILVER LAYER OF ERP_CUST_AZ12 <-- --
+Truncate Table silver.erp_cust_az12;
+Insert into silver.erp_cust_az12 (
+cid,
+bdate, 
+gen
+)
+
+select 
+CASE
+	when cid LIKE "NAS%" THEN SUBSTRING(cid,4,length(cid))
+    else cid
+END as cid,                                          -- Remove NAS prefix if present
+CASE
+	when bdate > current_date() THEN null             
+    else bdate                                           
+END as bdate,                                        -- Set future bdates to NULL
+CASE
+	when upper(gen) LIKE "M%" THEN "Male"
+    when upper(gen) LIKE "F%" THEN "Female"
+    else "Unknown"
+END as gen                                           -- Resolving Gender Inconsistencies and handle unknown cases
+from bronze.erp_cust_az12;
+
+-- ============================================================================= --
+
+-- --> DATA LOADING INTO SILVER LAYER OF ERP_LOC_A101 <-- --
+Truncate Table silver.erp_loc_a101;
+Insert into silver.erp_loc_a101 (
+cid,
+cntry
+)
+
+select
+Replace(cid, "-","") as cid,
+CASE
+        WHEN TRIM(REPLACE(REPLACE(cntry, '\r', ''), '\n', '')) = 'DE' 
+            THEN 'Germany'
+        WHEN TRIM(REPLACE(REPLACE(cntry, '\r', ''), '\n', '')) IN ('US', 'USA') 
+            THEN 'United States'
+        WHEN TRIM(REPLACE(REPLACE(cntry, '\r', ''), '\n', '')) = '' 
+             OR cntry IS NULL
+            THEN 'Not Available'
+        ELSE TRIM(REPLACE(REPLACE(cntry, '\r', ''), '\n', ''))
+END AS cntry                                                               -- Normalize and Handle missing or blank country information       
+from bronze.erp_loc_a101;
+
+-- ============================================================================ --
+
+-- --> DATA LOADING INTO SILVER LAYER OF ERP_PX_CAT_G1v2 <-- --
+Truncate Table silver.erp_px_cat_g1v2;
+Insert into silver.erp_px_cat_g1v2 (
+id, 
+cat,
+subcat,
+maintenance
+)
+Select
+id,
+cat,
+subcat,
+maintenance from bronze.erp_px_cat_g1v2;
+
+-- ============================================================================== --
